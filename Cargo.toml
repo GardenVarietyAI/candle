@@ -1,13 +1,8 @@
 [workspace]
 members = [
     "candle-core",
-    "candle-datasets",
-    "candle-examples",
     "candle-nn",
-    "candle-pyo3",
-    "candle-transformers",
-    "candle-wasm-examples/*",
-    "candle-wasm-tests",
+    "candle-transformers", 
     "tensor-tools",
 ]
 exclude = [
