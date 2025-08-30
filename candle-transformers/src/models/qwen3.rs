@@ -224,7 +224,14 @@ impl Qwen3Attention {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
-            scores = scores.broadcast_add(m)?;
+            // Slice the mask to match key sequence length (handle KV cache)
+            let key_len = k.dim(2)?;
+            let sliced_mask = if m.dim(3)? != key_len {
+                m.narrow(3, 0, key_len)?
+            } else {
+                m.clone()
+            };
+            scores = scores.broadcast_add(&sliced_mask)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?; // (B, H, L, D)
@@ -322,9 +329,11 @@ impl Model {
         sw: Option<usize>,
     ) -> Result<Tensor> {
         let minf = f32::NEG_INFINITY;
+        // Create a large mask that can be sliced in attention layer
+        let max_len = self.max_position_embeddings;
         let mask: Vec<_> = (0..tgt)
             .flat_map(|i| {
-                (0..(tgt + offset)).map(move |j| {
+                (0..max_len).map(move |j| {
                     let past_ok = j <= i + offset;
                     let sw_ok = match sw {
                         Some(w) => (i + offset) as i64 - j as i64 <= w as i64,
@@ -338,7 +347,7 @@ impl Model {
                 })
             })
             .collect();
-        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+        Tensor::from_slice(&mask, (b, 1, tgt, max_len), &self.device)?.to_dtype(self.dtype)
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
