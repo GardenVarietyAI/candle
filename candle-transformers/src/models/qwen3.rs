@@ -330,7 +330,7 @@ impl Model {
     ) -> Result<Tensor> {
         let minf = f32::NEG_INFINITY;
         // Create a large mask that can be sliced in attention layer
-        let max_len = self.max_position_embeddings;
+        let max_len = 32768; // Use Qwen3's default max context
         let mask: Vec<_> = (0..tgt)
             .flat_map(|i| {
                 (0..max_len).map(move |j| {
