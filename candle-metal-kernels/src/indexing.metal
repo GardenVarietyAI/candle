@@ -19,6 +19,11 @@ inline uint8_t max_value<uint8_t>() {
     return 0xFF;
 }
 
+template <>
+inline float max_value<float>() {
+    return 3.40282347e+38f; // FLT_MAX
+}
+
 METAL_FUNC uint get_strided_index(
     uint idx,
     constant size_t &num_dims,
@@ -261,6 +266,9 @@ kernel void NAME( \
 
 INDEX_OP(is_i64_f32, int64_t, float)
 INDEX_OP(is_i64_f16, int64_t, half)
+INDEX_OP(is_i64_u8, int64_t, uint8_t)
+INDEX_OP(is_i64_u32, int64_t, uint32_t)
+INDEX_OP(is_i64_i64, int64_t, int64_t)
 #if defined(__HAVE_BFLOAT__)
 INDEX_OP(is_i64_bf16, int64_t, bfloat)
 #endif
@@ -269,6 +277,7 @@ INDEX_OP(is_u32_u8, uint32_t, uint8_t)
 INDEX_OP(is_u32_u32, uint32_t, uint32_t)
 INDEX_OP(is_u32_f32, uint32_t, float)
 INDEX_OP(is_u32_f16, uint32_t, half)
+INDEX_OP(is_u32_i64, uint32_t, int64_t)
 #if defined(__HAVE_BFLOAT__)
 INDEX_OP(is_u32_bf16, uint32_t, bfloat)
 #endif
@@ -277,6 +286,7 @@ INDEX_OP(is_u8_u8, uint8_t, uint8_t)
 INDEX_OP(is_u8_u32, uint8_t, uint32_t)
 INDEX_OP(is_u8_f32, uint8_t, float)
 INDEX_OP(is_u8_f16, uint8_t, half)
+INDEX_OP(is_u8_i64, uint8_t, int64_t)
 #if defined(__HAVE_BFLOAT__)
 INDEX_OP(is_u8_bf16, uint8_t, bfloat)
 #endif
