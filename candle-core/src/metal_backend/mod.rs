@@ -1714,14 +1714,36 @@ impl BackendStorage for MetalStorage {
         }
         let command_buffer = self.device.command_buffer()?;
         if src_s == d2 && dst_s == d2 {
-            command_buffer.set_label("copy2d_contiguous");
-            let blit = command_buffer.blit_command_encoder();
-            blit.set_label("copy2d_contiguous");
-            let src_offset = src_o * self.dtype.size_in_bytes();
             let length = d1 * d2 * self.dtype.size_in_bytes();
-            let dst_offset = dst_o * dst.dtype().size_in_bytes();
-            blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length);
-            blit.end_encoding();
+            // For large copies, use chunked approach to avoid Metal hang
+            if length > 64 * 1024 * 1024 {  // 64MB limit
+                let max_chunk_elements = 16 * 1024 * 1024 / self.dtype.size_in_bytes(); // 16MB chunks
+                let elements_per_row = d2;
+                let chunk_rows = max_chunk_elements / elements_per_row;
+                let total_rows = d1;
+                
+                for start_row in (0..total_rows).step_by(chunk_rows) {
+                    let end_row = (start_row + chunk_rows).min(total_rows);
+                    let chunk_d1 = end_row - start_row;
+                    let chunk_length = chunk_d1 * d2 * self.dtype.size_in_bytes();
+                    
+                    command_buffer.set_label("copy2d_chunked");
+                    let blit = command_buffer.blit_command_encoder();
+                    blit.set_label("copy2d_chunked");
+                    let src_offset = (src_o + start_row * src_s) * self.dtype.size_in_bytes();
+                    let dst_offset = (dst_o + start_row * dst_s) * dst.dtype().size_in_bytes();
+                    blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, chunk_length);
+                    blit.end_encoding();
+                }
+            } else {
+                command_buffer.set_label("copy2d_contiguous");
+                let blit = command_buffer.blit_command_encoder();
+                blit.set_label("copy2d_contiguous");
+                let src_offset = src_o * self.dtype.size_in_bytes();
+                let dst_offset = dst_o * dst.dtype().size_in_bytes();
+                blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, length);
+                blit.end_encoding();
+            }
         } else {
             let el_count = d1 * d2;
             if el_count == 0 {
