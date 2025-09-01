@@ -1722,19 +1722,20 @@ impl BackendStorage for MetalStorage {
                 let chunk_rows = max_chunk_elements / elements_per_row;
                 let total_rows = d1;
                 
+                command_buffer.set_label("copy2d_chunked");
+                let blit = command_buffer.blit_command_encoder();
+                blit.set_label("copy2d_chunked");
+                
                 for start_row in (0..total_rows).step_by(chunk_rows) {
                     let end_row = (start_row + chunk_rows).min(total_rows);
                     let chunk_d1 = end_row - start_row;
                     let chunk_length = chunk_d1 * d2 * self.dtype.size_in_bytes();
                     
-                    command_buffer.set_label("copy2d_chunked");
-                    let blit = command_buffer.blit_command_encoder();
-                    blit.set_label("copy2d_chunked");
                     let src_offset = (src_o + start_row * src_s) * self.dtype.size_in_bytes();
                     let dst_offset = (dst_o + start_row * dst_s) * dst.dtype().size_in_bytes();
                     blit.copy_from_buffer(&self.buffer, src_offset, dst.buffer(), dst_offset, chunk_length);
-                    blit.end_encoding();
                 }
+                blit.end_encoding();
             } else {
                 command_buffer.set_label("copy2d_contiguous");
                 let blit = command_buffer.blit_command_encoder();
