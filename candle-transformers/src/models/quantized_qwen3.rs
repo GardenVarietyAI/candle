@@ -387,26 +387,27 @@ impl ModelWeights {
         b: usize,
         tgt: usize,
         offset: usize,
-        sw: Option<usize>,
+        _sw: Option<usize>,
     ) -> Result<Tensor> {
-        let minf = f32::NEG_INFINITY;
         let mask: Vec<_> = (0..tgt)
             .flat_map(|i| {
-                (0..(tgt + offset)).map(move |j| {
-                    let past_ok = j <= i + offset;
-                    let sw_ok = match sw {
-                        Some(w) => (i + offset) as i64 - j as i64 <= w as i64,
-                        None => true,
-                    };
-                    if past_ok && sw_ok {
-                        0.
+                (0..tgt).map(move |j| {
+                    if i < j {
+                        f32::NEG_INFINITY
                     } else {
-                        minf
+                        0.
                     }
                 })
             })
             .collect();
-        Tensor::from_slice(&mask, (b, 1, tgt, tgt + offset), &self.device)?.to_dtype(self.dtype)
+        let mask = Tensor::from_slice(&mask, (tgt, tgt), &self.device)?;
+        let mask = if offset > 0 {
+            let mask0 = Tensor::zeros((tgt, offset), self.dtype, &self.device)?;
+            Tensor::cat(&[&mask0, &mask], 1)?
+        } else {
+            mask
+        };
+        mask.expand((b, 1, tgt, tgt + offset))?.to_dtype(self.dtype)
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
