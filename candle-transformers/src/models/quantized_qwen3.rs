@@ -227,12 +227,18 @@ impl AttentionWeights {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
-            let m_dtype = m.dtype();
-            let scores_dtype = scores.dtype();
-            let mask = if m_dtype != scores_dtype {
-                m.to_dtype(scores_dtype)?
+            let key_len = k.dim(2)?;
+            let query_len = q.dim(2)?;
+            let mask_key_len = m.dim(3)?;
+            let adjusted_mask = if mask_key_len != key_len {
+                m.narrow(3, 0, key_len)?
             } else {
                 m.clone()
+            };
+            let mask = if adjusted_mask.dtype() != scores.dtype() {
+                adjusted_mask.to_dtype(scores.dtype())?
+            } else {
+                adjusted_mask
             };
             scores = scores.broadcast_add(&mask)?;
         }
@@ -387,7 +393,6 @@ impl ModelWeights {
         b: usize,
         tgt: usize,
         offset: usize,
-        _sw: Option<usize>,
     ) -> Result<Tensor> {
         let mask: Vec<_> = (0..tgt)
             .flat_map(|i| {
@@ -417,7 +422,7 @@ impl ModelWeights {
         let causal_mask = if l == 1 {
             None
         } else {
-            Some(self.causal_mask(b, l, offset, None)?)
+            Some(self.causal_mask(b, l, offset)?)
         };
         for layer in &mut self.layers {
             h = layer.forward(&h, causal_mask.as_ref(), offset)?;
