@@ -159,7 +159,7 @@ impl Qwen3Attention {
 
         // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
         // The cache will grow in chunks of 512 tokens when needed.
-        let kv_cache = KvCache::new(2, 512);
+        let kv_cache = KvCache::new(2, 8192);
 
         Ok(Self {
             q_proj,
@@ -224,14 +224,27 @@ impl Qwen3Attention {
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
         if let Some(m) = attn_mask {
-            // Slice the mask to match key sequence length (handle KV cache)
             let key_len = k.dim(2)?;
-            let sliced_mask = if m.dim(3)? != key_len {
-                m.narrow(3, 0, key_len)?
+            let query_len = q.dim(2)?;
+            let mask_query_len = m.dim(2)?;
+            let mask_key_len = m.dim(3)?;
+            tracing::debug!("Before masking - Q: {:?}, K: {:?}, scores: {:?}, mask: {:?}", 
+                           q.shape(), k.shape(), scores.shape(), m.shape());
+            tracing::debug!("Lengths - query: {}, key: {}, mask_query: {}, mask_key: {}", 
+                           query_len, key_len, mask_query_len, mask_key_len);
+            
+            // Ensure mask dimensions match the actual query and key lengths
+            let adjusted_mask = if mask_query_len != query_len || mask_key_len != key_len {
+                // Slice both dimensions to match actual tensor sizes
+                let q_slice = mask_query_len.min(query_len);
+                let k_slice = mask_key_len.min(key_len);
+                m.narrow(2, mask_query_len - q_slice, q_slice)?
+                 .narrow(3, mask_key_len - k_slice, k_slice)?
             } else {
                 m.clone()
             };
-            scores = scores.broadcast_add(&sliced_mask)?;
+            
+            scores = scores.broadcast_add(&adjusted_mask)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
         let ctx = probs.matmul(&v)?; // (B, H, L, D)
@@ -326,28 +339,30 @@ impl Model {
         b: usize,
         tgt: usize,
         offset: usize,
-        sw: Option<usize>,
     ) -> Result<Tensor> {
-        let minf = f32::NEG_INFINITY;
-        // Create a large mask that can be sliced in attention layer
-        let max_len = 32768; // Use Qwen3's default max context
+        tracing::debug!("Creating causal mask: b={}, tgt={}, offset={}", b, tgt, offset);
         let mask: Vec<_> = (0..tgt)
             .flat_map(|i| {
-                (0..max_len).map(move |j| {
-                    let past_ok = j <= i + offset;
-                    let sw_ok = match sw {
-                        Some(w) => (i + offset) as i64 - j as i64 <= w as i64,
-                        None => true,
-                    };
-                    if past_ok && sw_ok {
-                        0.
+                (0..tgt).map(move |j| {
+                    if i < j {
+                        f32::NEG_INFINITY
                     } else {
-                        minf
+                        0.
                     }
                 })
             })
             .collect();
-        Tensor::from_slice(&mask, (b, 1, tgt, max_len), &self.device)?.to_dtype(self.dtype)
+        tracing::debug!("Mask vector created, size: {}", mask.len());
+        let mask = Tensor::from_slice(&mask, (tgt, tgt), &self.device)?;
+        tracing::debug!("Base mask tensor created: {:?}", mask.shape());
+        let mask = if offset > 0 {
+            let mask0 = Tensor::zeros((tgt, offset), self.dtype, &self.device)?;
+            Tensor::cat(&[&mask0, &mask], 1)?
+        } else {
+            mask
+        };
+        tracing::debug!("Final mask shape: {:?}", mask.shape());
+        mask.expand((b, 1, tgt, tgt + offset))?.to_dtype(self.dtype)
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
@@ -357,7 +372,7 @@ impl Model {
         let causal = if l == 1 {
             None
         } else {
-            Some(self.causal_mask(b, l, offset, None)?)
+            Some(self.causal_mask(b, l, offset)?)
         };
 
         for layer in &mut self.layers {
