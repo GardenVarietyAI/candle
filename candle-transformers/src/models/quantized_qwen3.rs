@@ -186,70 +186,44 @@ impl AttentionWeights {
     fn forward(&mut self, x: &Tensor, attn_mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b, l, _) = x.dims3()?;
-        tracing::debug!("GGUF attention start: x shape {:?}", x.shape());
 
-        tracing::debug!("GGUF doing q_proj");
         let q = self.q_proj.forward(x)?;
-        tracing::debug!("GGUF doing k_proj");
         let k = self.k_proj.forward(x)?;
-        tracing::debug!("GGUF doing v_proj");
         let v = self.v_proj.forward(x)?;
-        tracing::debug!("GGUF projections done");
 
-        tracing::debug!("GGUF reshaping q");
         let q = q
             .reshape((b, l, self.num_heads, self.head_dim))?
             .transpose(1, 2)?;
-        tracing::debug!("GGUF reshaping k");
         let k = k
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        tracing::debug!("GGUF reshaping v");
         let v = v
             .reshape((b, l, self.num_kv_heads, self.head_dim))?
             .transpose(1, 2)?;
-        tracing::debug!("GGUF reshapes done");
 
-        tracing::debug!("GGUF flattening qk");
         let q_flat = q.flatten(0, 2)?;
         let k_flat = k.flatten(0, 2)?;
-        tracing::debug!("GGUF applying q_norm");
         let q_flat = self.q_norm.forward(&q_flat)?;
-        tracing::debug!("GGUF applying k_norm");
         let k_flat = self.k_norm.forward(&k_flat)?;
-        tracing::debug!("GGUF norms done");
-        tracing::debug!("GGUF reshaping q back");
         let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
-        tracing::debug!("GGUF reshaping k back");
         let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
-        tracing::debug!("GGUF applying rope");
-        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
-        tracing::debug!("GGUF rope done");
 
-        tracing::debug!("GGUF resetting kv cache");
+        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+
         if offset == 0 {
             self.kv_cache.reset();
         }
-        tracing::debug!("GGUF appending to kv cache - k shape: {:?}, v shape: {:?}", k.shape(), v.shape());
-        let k_contig = k.contiguous()?;
-        let v_contig = v.contiguous()?;
-        tracing::debug!("GGUF tensors made contiguous");
-        let (k, v) = self.kv_cache.append(&k_contig, &v_contig)?;
-        tracing::debug!("GGUF kv cache done");
+        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
 
         // Make tensor contiguous to avoid some strided copies
         let k = k.contiguous()?;
         let v = v.contiguous()?;
 
-        tracing::debug!("GGUF repeat_kv");
         let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
         let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
-        tracing::debug!("GGUF repeat_kv done");
 
-        tracing::debug!("GGUF computing attention scores");
         let scale = 1.0 / (self.head_dim as f64).sqrt();
         let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-        tracing::debug!("GGUF scores computed");
         if let Some(m) = attn_mask {
             let key_len = k.dim(2)?;
             let mask_key_len = m.dim(3)?;
@@ -264,13 +238,9 @@ impl AttentionWeights {
                 adjusted_mask
             };
             scores = scores.broadcast_add(&mask)?;
-            tracing::debug!("GGUF mask applied");
         }
-        tracing::debug!("GGUF computing softmax");
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        tracing::debug!("GGUF computing context");
         let ctx = probs.matmul(&v)?; // (B, H, L, D)
-        tracing::debug!("GGUF context computed");
         let reshaped_ctx = ctx
             .transpose(1, 2)?
             .reshape((b, l, self.num_heads * self.head_dim))?;
@@ -445,26 +415,18 @@ impl ModelWeights {
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
-        tracing::debug!("GGUF forward start: input shape {:?}", input.shape());
         let mut h = self.embed_tokens.forward(input)?;
-        tracing::debug!("GGUF embeddings done");
         let causal_mask = if l == 1 {
             None
         } else {
-            tracing::debug!("GGUF creating causal mask for l={}", l);
             Some(self.causal_mask(b, l, offset)?)
         };
-        tracing::debug!("GGUF mask created, processing {} layers", self.layers.len());
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            tracing::debug!("GGUF layer {} start", i);
+        for layer in self.layers.iter_mut() {
             h = layer.forward(&h, causal_mask.as_ref(), offset)?;
-            tracing::debug!("GGUF layer {} done", i);
         }
-        tracing::debug!("GGUF all layers done, applying norm");
         let h = self.norm.forward(&h)?;
         let _enter = self.span_output.enter();
         let last_hidden = h.narrow(1, l - 1, 1)?;
-        tracing::debug!("GGUF applying lm_head");
         self.lm_head.forward(&last_hidden)?.squeeze(1)
     }
 }

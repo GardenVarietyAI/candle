@@ -228,10 +228,6 @@ impl Qwen3Attention {
             let query_len = q.dim(2)?;
             let mask_query_len = m.dim(2)?;
             let mask_key_len = m.dim(3)?;
-            tracing::debug!("Before masking - Q: {:?}, K: {:?}, scores: {:?}, mask: {:?}", 
-                           q.shape(), k.shape(), scores.shape(), m.shape());
-            tracing::debug!("Lengths - query: {}, key: {}, mask_query: {}, mask_key: {}", 
-                           query_len, key_len, mask_query_len, mask_key_len);
             
             // Ensure mask dimensions match the actual query and key lengths
             let adjusted_mask = if mask_query_len != query_len || mask_key_len != key_len {
@@ -340,7 +336,6 @@ impl Model {
         tgt: usize,
         offset: usize,
     ) -> Result<Tensor> {
-        tracing::debug!("Creating causal mask: b={}, tgt={}, offset={}", b, tgt, offset);
         let mask: Vec<_> = (0..tgt)
             .flat_map(|i| {
                 (0..tgt).map(move |j| {
@@ -352,16 +347,13 @@ impl Model {
                 })
             })
             .collect();
-        tracing::debug!("Mask vector created, size: {}", mask.len());
         let mask = Tensor::from_slice(&mask, (tgt, tgt), &self.device)?;
-        tracing::debug!("Base mask tensor created: {:?}", mask.shape());
         let mask = if offset > 0 {
             let mask0 = Tensor::zeros((tgt, offset), self.dtype, &self.device)?;
             Tensor::cat(&[&mask0, &mask], 1)?
         } else {
             mask
         };
-        tracing::debug!("Final mask shape: {:?}", mask.shape());
         mask.expand((b, 1, tgt, tgt + offset))?.to_dtype(self.dtype)
     }
 
