@@ -67,11 +67,17 @@ impl Cache {
         };
         let ad = self.all_data.as_mut().unwrap();
         if self.current_seq_len + seq_len > self.max_seq_len {
-            let mut shape = src.dims().to_vec();
-            shape[self.dim] = self.grow_by;
-            let next_ad = Tensor::zeros(shape, src.dtype(), src.device())?;
-            *ad = Tensor::cat(&[&*ad, &next_ad], self.dim)?;
-            self.max_seq_len += self.grow_by;
+            // Recreate entire tensor with larger size
+            let new_max = ((self.current_seq_len + seq_len + self.grow_by - 1) / self.grow_by) * self.grow_by;
+            let mut new_shape = src.dims().to_vec();
+            new_shape[self.dim] = new_max;
+            let new_ad = Tensor::zeros(new_shape, src.dtype(), src.device())?;
+            if self.current_seq_len > 0 {
+                let current_data = ad.narrow(self.dim, 0, self.current_seq_len)?;
+                new_ad.slice_set(&current_data, self.dim, 0)?;
+            }
+            *ad = new_ad;
+            self.max_seq_len = new_max;
         }
         ad.slice_set(src, self.dim, self.current_seq_len)?;
         self.current_seq_len += seq_len;
