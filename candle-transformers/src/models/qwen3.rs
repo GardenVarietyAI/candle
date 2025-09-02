@@ -3,7 +3,7 @@ use crate::{
     utils::repeat_kv,
 };
 use candle::{DType, Device, Module, Result, Tensor};
-use candle_nn::{kv_cache::KvCache, Activation, VarBuilder};
+use candle_nn::{kv_cache::RotatingKvCache, Activation, VarBuilder};
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
@@ -108,7 +108,7 @@ pub(crate) struct Qwen3Attention {
     hidden_size: usize,
     // utils
     rotary_emb: Arc<Qwen3RotaryEmbedding>,
-    kv_cache: KvCache,
+    kv_cache: RotatingKvCache,
 }
 
 impl Qwen3Attention {
@@ -159,7 +159,7 @@ impl Qwen3Attention {
 
         // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
         // The cache will grow in chunks of 512 tokens when needed.
-        let kv_cache = KvCache::new(2, 8192);
+        let kv_cache = RotatingKvCache::new(2, 8192);
 
         Ok(Self {
             q_proj,
@@ -236,7 +236,7 @@ impl Qwen3Attention {
                     let query_len = q.dim(2)?;
                     let mask_query_len = m.dim(2)?;
                     let mask_key_len = m.dim(3)?;
-                    
+
                     let adjusted_mask = if mask_query_len != query_len || mask_key_len != key_len {
                         let q_slice = mask_query_len.min(query_len);
                         let k_slice = mask_key_len.min(key_len);
