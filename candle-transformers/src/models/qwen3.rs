@@ -220,50 +220,30 @@ impl Qwen3Attention {
         let k = repeat_kv(k, self.num_kv_groups)?;
         let v = repeat_kv(v, self.num_kv_groups)?;
 
-        // 7. Flash attention
+        // 7. Attention score
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let ctx = match x.device() {
-            Device::Cpu => {
-                candle_nn::cpu_flash_attention::run_flash_attn_cpu::<f32>(
-                    &q, &k, &v, attn_mask, scale as f32, None, None
-                )?
-            }
-            Device::Metal(_) => {
-                // Use Metal SDPA kernel
-                let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-                let scores = if let Some(m) = attn_mask {
-                    let key_len = k.dim(2)?;
-                    let query_len = q.dim(2)?;
-                    let mask_query_len = m.dim(2)?;
-                    let mask_key_len = m.dim(3)?;
-                    
-                    let adjusted_mask = if mask_query_len != query_len || mask_key_len != key_len {
-                        let q_slice = mask_query_len.min(query_len);
-                        let k_slice = mask_key_len.min(key_len);
-                        m.narrow(2, mask_query_len - q_slice, q_slice)?
-                         .narrow(3, mask_key_len - k_slice, k_slice)?
-                    } else {
-                        m.clone()
-                    };
-                    scores.broadcast_add(&adjusted_mask)?
-                } else {
-                    scores
-                };
-                let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-                probs.matmul(&v)?
-            }
-            Device::Cuda(_) => {
-                // Fallback to standard attention for CUDA
-                let scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
-                let scores = if let Some(m) = attn_mask {
-                    scores.broadcast_add(m)?
-                } else {
-                    scores
-                };
-                let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-                probs.matmul(&v)?
-            }
-        };
+        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        if let Some(m) = attn_mask {
+            let key_len = k.dim(2)?;
+            let query_len = q.dim(2)?;
+            let mask_query_len = m.dim(2)?;
+            let mask_key_len = m.dim(3)?;
+            
+            // Ensure mask dimensions match the actual query and key lengths
+            let adjusted_mask = if mask_query_len != query_len || mask_key_len != key_len {
+                // Slice both dimensions to match actual tensor sizes
+                let q_slice = mask_query_len.min(query_len);
+                let k_slice = mask_key_len.min(key_len);
+                m.narrow(2, mask_query_len - q_slice, q_slice)?
+                 .narrow(3, mask_key_len - k_slice, k_slice)?
+            } else {
+                m.clone()
+            };
+            
+            scores = scores.broadcast_add(&adjusted_mask)?;
+        }
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let ctx = probs.matmul(&v)?; // (B, H, L, D)
 
         // 8. Output proj
         ctx.transpose(1, 2)?
