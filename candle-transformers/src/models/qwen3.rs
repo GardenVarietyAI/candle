@@ -364,7 +364,9 @@ impl Model {
         let causal = if l == 1 {
             None
         } else {
-            Some(self.causal_mask(b, l, offset)?)
+            // Use actual KV cache length instead of offset
+            let kv_len = self.layers[0].self_attn.kv_cache.current_seq_len();
+            Some(self.causal_mask(b, l, kv_len)?)
         };
 
         for layer in &mut self.layers {
