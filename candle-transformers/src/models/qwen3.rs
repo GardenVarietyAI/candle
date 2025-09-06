@@ -33,7 +33,7 @@ pub(crate) struct Qwen3RotaryEmbedding {
 }
 
 impl Qwen3RotaryEmbedding {
-    pub(crate) fn new(dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+    pub(crate) fn new(dtype: DType, compute_dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
         let dim = cfg.head_dim;
         let max_seq_len = cfg.max_position_embeddings;
         let inv_freq: Vec<_> = (0..dim)
@@ -41,9 +41,9 @@ impl Qwen3RotaryEmbedding {
             .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
             .collect();
         let inv_freq_len = inv_freq.len();
-        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(DType::F32)?;
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(compute_dtype)?;
         let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
-            .to_dtype(DType::F32)?
+            .to_dtype(compute_dtype)?
             .reshape((max_seq_len, 1))?;
         let freqs = t.matmul(&inv_freq)?;
         Ok(Self {
@@ -109,12 +109,16 @@ pub(crate) struct Qwen3Attention {
     // utils
     rotary_emb: Arc<Qwen3RotaryEmbedding>,
     kv_cache: KvCache,
+    kv_cache_dtype: DType,
+    compute_dtype: DType,
 }
 
 impl Qwen3Attention {
     pub(crate) fn new(
         cfg: &Config,
         rotary_emb: Arc<Qwen3RotaryEmbedding>,
+        compute_dtype: DType,
+        kv_cache_dtype: DType,
         vb: VarBuilder,
     ) -> Result<Self> {
         if cfg.use_sliding_window {
@@ -157,8 +161,7 @@ impl Qwen3Attention {
         // Necessary because the hidden_size in the config isn't always accurate
         let hidden_size = head_dim * cfg.num_attention_heads;
 
-        // Initialize KV cache with 512 tokens capacity to reduce initial memory allocation.
-        // The cache will grow in chunks of 512 tokens when needed.
+        // Initialize KV cache - dtype will be set by first append operation
         let kv_cache = KvCache::new(2, 8192);
 
         Ok(Self {
@@ -175,6 +178,8 @@ impl Qwen3Attention {
             hidden_size,
             rotary_emb,
             kv_cache,
+            kv_cache_dtype,
+            compute_dtype,
         })
     }
 
@@ -186,10 +191,19 @@ impl Qwen3Attention {
     ) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
 
-        // 1. Proj
-        let q = self.q_proj.forward(x)?;
-        let k = self.k_proj.forward(x)?;
-        let v = self.v_proj.forward(x)?;
+        // 1. Proj (convert to compute dtype only if needed)
+        let q_proj = self.q_proj.forward(x)?;
+        let k_proj = self.k_proj.forward(x)?;
+        let v_proj = self.v_proj.forward(x)?;
+        let q = if q_proj.dtype() != self.compute_dtype {
+            q_proj.to_dtype(self.compute_dtype)?
+        } else { q_proj };
+        let k = if k_proj.dtype() != self.compute_dtype {
+            k_proj.to_dtype(self.compute_dtype)?
+        } else { k_proj };
+        let v = if v_proj.dtype() != self.compute_dtype {
+            v_proj.to_dtype(self.compute_dtype)?
+        } else { v_proj };
 
         // 2. Reshape: (B, L, H, D) -> (B, H, L, D)
         let q = q
@@ -213,8 +227,20 @@ impl Qwen3Attention {
         // 4. RoPE
         let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
 
-        // 5. Accumulate KV cache
-        let (k, v) = self.kv_cache.append(&k.contiguous()?, &v.contiguous()?)?;
+        // 5. Accumulate KV cache - convert dtype only if needed to avoid overhead
+        let k_contiguous = k.contiguous()?;
+        let v_contiguous = v.contiguous()?;
+        let k_cache = if k_contiguous.dtype() != self.kv_cache_dtype {
+            k_contiguous.to_dtype(self.kv_cache_dtype)?
+        } else {
+            k_contiguous
+        };
+        let v_cache = if v_contiguous.dtype() != self.kv_cache_dtype {
+            v_contiguous.to_dtype(self.kv_cache_dtype)?
+        } else {
+            v_contiguous
+        };
+        let (k, v) = self.kv_cache.append(&k_cache, &v_cache)?;
 
         // 6. GQA repeat_kv
         let k = repeat_kv(k, self.num_kv_groups)?;
@@ -228,7 +254,7 @@ impl Qwen3Attention {
             let query_len = q.dim(2)?;
             let mask_query_len = m.dim(2)?;
             let mask_key_len = m.dim(3)?;
-            
+
             // Ensure mask dimensions match the actual query and key lengths
             let adjusted_mask = if mask_query_len != query_len || mask_key_len != key_len {
                 // Slice both dimensions to match actual tensor sizes
@@ -239,7 +265,7 @@ impl Qwen3Attention {
             } else {
                 m.clone()
             };
-            
+
             scores = scores.broadcast_add(&adjusted_mask)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
@@ -265,8 +291,14 @@ struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    fn new(cfg: &Config, rotary: Arc<Qwen3RotaryEmbedding>, vb: VarBuilder) -> Result<Self> {
-        let self_attn = Qwen3Attention::new(cfg, rotary, vb.pp("self_attn"))?;
+    fn new(
+        cfg: &Config,
+        rotary: Arc<Qwen3RotaryEmbedding>,
+        compute_dtype: DType,
+        kv_cache_dtype: DType,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let self_attn = Qwen3Attention::new(cfg, rotary, compute_dtype, kv_cache_dtype, vb.pp("self_attn"))?;
         let mlp = Qwen3MLP::new(cfg, vb.pp("mlp"))?;
         let ln1 = RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("input_layernorm"))?;
         let ln2 = RmsNorm::new(
@@ -302,25 +334,27 @@ pub struct Model {
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     device: Device,
-    dtype: DType,
+    weights_dtype: DType,
+    compute_dtype: DType,
 }
 
 impl Model {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+    pub fn new(cfg: &Config, compute_dtype: DType, kv_cache_dtype: DType, vb: VarBuilder) -> Result<Self> {
         let embed_tokens =
             candle_nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
-        let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), cfg, vb.device())?);
+        let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), compute_dtype, cfg, vb.device())?);
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         let vb_l = vb.pp("model.layers");
         for i in 0..cfg.num_hidden_layers {
-            layers.push(DecoderLayer::new(cfg, rotary.clone(), vb_l.pp(i))?);
+            layers.push(DecoderLayer::new(cfg, rotary.clone(), compute_dtype, kv_cache_dtype, vb_l.pp(i))?);
         }
         Ok(Self {
             embed_tokens,
             layers,
             norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?,
             device: vb.device().clone(),
-            dtype: vb.dtype(),
+            weights_dtype: vb.dtype(),
+            compute_dtype,
         })
     }
 
@@ -347,14 +381,14 @@ impl Model {
                 })
             })
             .collect();
-        let mask = Tensor::from_slice(&mask, (tgt, tgt), &self.device)?;
+        let mask = Tensor::from_slice(&mask, (tgt, tgt), &self.device)?.to_dtype(self.compute_dtype)?;
         let mask = if offset > 0 {
-            let mask0 = Tensor::zeros((tgt, offset), self.dtype, &self.device)?;
+            let mask0 = Tensor::zeros((tgt, offset), self.compute_dtype, &self.device)?;
             Tensor::cat(&[&mask0, &mask], 1)?
         } else {
             mask
         };
-        mask.expand((b, 1, tgt, tgt + offset))?.to_dtype(self.dtype)
+        mask.expand((b, 1, tgt, tgt + offset))?.to_dtype(self.compute_dtype)
     }
 
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
@@ -383,8 +417,8 @@ pub struct ModelForCausalLM {
 }
 
 impl ModelForCausalLM {
-    pub fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
-        let base = Model::new(cfg, vb.clone())?;
+    pub fn new(cfg: &Config, compute_dtype: DType, kv_cache_dtype: DType, vb: VarBuilder) -> Result<Self> {
+        let base = Model::new(cfg, compute_dtype, kv_cache_dtype, vb.clone())?;
         let lm_head = if cfg.tie_word_embeddings {
             Linear::from_weights(base.embed_tokens.embeddings().clone(), None)
         } else {
