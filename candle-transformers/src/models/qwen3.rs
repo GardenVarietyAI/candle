@@ -334,7 +334,6 @@ pub struct Model {
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     device: Device,
-    weights_dtype: DType,
     compute_dtype: DType,
 }
 
@@ -353,7 +352,6 @@ impl Model {
             layers,
             norm: RmsNorm::new(cfg.hidden_size, cfg.rms_norm_eps, vb.pp("model.norm"))?,
             device: vb.device().clone(),
-            weights_dtype: vb.dtype(),
             compute_dtype,
         })
     }
