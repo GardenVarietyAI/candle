@@ -161,8 +161,7 @@ impl Qwen3Attention {
         // Necessary because the hidden_size in the config isn't always accurate
         let hidden_size = head_dim * cfg.num_attention_heads;
 
-        // Initialize KV cache - dtype will be set by first append operation
-        let kv_cache = KvCache::new(2, 8192);
+        let kv_cache = KvCache::new(2, 512);
 
         Ok(Self {
             q_proj,
