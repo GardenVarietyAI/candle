@@ -79,7 +79,10 @@ impl Cache {
             *ad = new_ad;
             self.max_seq_len = new_max;
         }
-        ad.slice_set(src, self.dim, self.current_seq_len)?;
+        if !ad.is_contiguous() {
+            *ad = ad.contiguous()?;
+        }
+        ad.slice_set(&src.contiguous()?, self.dim, self.current_seq_len)?;
         self.current_seq_len += seq_len;
         Ok(())
     }
