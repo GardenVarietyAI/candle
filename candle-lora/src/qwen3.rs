@@ -1,0 +1,554 @@
+//! Qwen3 model with lightweight runtime LoRA wrappers for hot-swapping adapters.
+//! This mirrors candle-transformers Qwen3 but replaces linear layers with a
+//! simple LoRA-aware Linear wrapper that can be updated at runtime using
+//! HF-style adapter weights (lora_A.weight / lora_B.weight) and scaling.
+
+use candle_core::{DType, Device, Module, Result, Tensor};
+use candle_nn::{self as nn, kv_cache::KvCache, Activation, VarBuilder};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use candle_transformers::models::qwen3::Config;
+
+use crate::lora_backend::LoraLinearRt;
+
+/// Extended LoraLinearRt with VarBuilder constructors for compatibility
+impl LoraLinearRt {
+    pub fn new_with_bias(
+        in_features: usize,
+        out_features: usize,
+        bias: bool,
+        vb: VarBuilder,
+        name: impl Into<String>,
+    ) -> Result<Self> {
+        let name_str = name.into();
+        let weight = vb.get((out_features, in_features), "weight")?;
+        let bias_tensor = if bias {
+            Some(vb.get(out_features, "bias")?)
+        } else {
+            None
+        };
+        Ok(LoraLinearRt::new(weight, bias_tensor, name_str))
+    }
+
+    pub fn from_weights(
+        weight: Tensor,
+        bias: Option<Tensor>,
+        name: impl Into<String>,
+    ) -> Self {
+        LoraLinearRt::new(weight, bias, name)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3RotaryEmbedding {
+    sin: Tensor,
+    cos: Tensor,
+}
+
+impl Qwen3RotaryEmbedding {
+    fn new(dtype: DType, compute_dtype: DType, cfg: &Config, dev: &Device) -> Result<Self> {
+        let dim = cfg.head_dim;
+        let max_seq_len = cfg.max_position_embeddings;
+        let inv_freq: Vec<_> = (0..dim)
+            .step_by(2)
+            .map(|i| 1f32 / cfg.rope_theta.powf(i as f64 / dim as f64) as f32)
+            .collect();
+        let inv_freq_len = inv_freq.len();
+        let inv_freq = Tensor::from_vec(inv_freq, (1, inv_freq_len), dev)?.to_dtype(compute_dtype)?;
+        let t = Tensor::arange(0u32, max_seq_len as u32, dev)?
+            .to_dtype(compute_dtype)?
+            .reshape((max_seq_len, 1))?;
+        let freqs = t.matmul(&inv_freq)?;
+        Ok(Self {
+            sin: freqs.sin()?.to_dtype(dtype)?,
+            cos: freqs.cos()?.to_dtype(dtype)?,
+        })
+    }
+
+    /// Apply RoPE (q, k shape: B x H x L x D)
+    fn apply(&self, q: &Tensor, k: &Tensor, offset: usize) -> Result<(Tensor, Tensor)> {
+        let (_, _, seq_len, _) = q.dims4()?;
+        let cos = self.cos.narrow(0, offset, seq_len)?;
+        let sin = self.sin.narrow(0, offset, seq_len)?;
+        let q_embed = candle_nn::rotary_emb::rope(&q.contiguous()?, &cos, &sin)?;
+        let k_embed = candle_nn::rotary_emb::rope(&k.contiguous()?, &cos, &sin)?;
+        Ok((q_embed, k_embed))
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3MLP {
+    gate_proj: LoraLinearRt,
+    up_proj: LoraLinearRt,
+    down_proj: LoraLinearRt,
+    act_fn: Activation,
+}
+
+impl Qwen3MLP {
+    fn new(cfg: &Config, vb: VarBuilder) -> Result<Self> {
+        Ok(Self {
+            gate_proj: LoraLinearRt::new_with_bias(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                false,
+                vb.pp("gate_proj"),
+                "mlp.gate_proj",
+            )?,
+            up_proj: LoraLinearRt::new_with_bias(
+                cfg.hidden_size,
+                cfg.intermediate_size,
+                false,
+                vb.pp("up_proj"),
+                "mlp.up_proj",
+            )?,
+            down_proj: LoraLinearRt::new_with_bias(
+                cfg.intermediate_size,
+                cfg.hidden_size,
+                false,
+                vb.pp("down_proj"),
+                "mlp.down_proj",
+            )?,
+            act_fn: cfg.hidden_act,
+        })
+    }
+
+    fn apply_adapter(&mut self, prefix: &str, map: &HashMap<String, (Tensor, Tensor)>, scale: f64) {
+        for (name, lin) in [
+            (format!("{prefix}.mlp.gate_proj"), &mut self.gate_proj),
+            (format!("{prefix}.mlp.up_proj"), &mut self.up_proj),
+            (format!("{prefix}.mlp.down_proj"), &mut self.down_proj),
+        ] {
+            if let Some((a, b)) = map.get(&name).cloned() {
+                tracing::debug!("Applied MLP LoRA adapter: {} -> {}", name, lin.name());
+                lin.set_adapter(a, b, scale);
+            } else {
+                tracing::debug!("No MLP LoRA adapter found for: {}", name);
+            }
+        }
+    }
+
+    fn clear_adapter(&mut self) {
+        self.gate_proj.clear_adapter();
+        self.up_proj.clear_adapter();
+        self.down_proj.clear_adapter();
+    }
+}
+
+impl Module for Qwen3MLP {
+    fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
+        let lhs = x.apply(&self.gate_proj)?.apply(&self.act_fn)?;
+        let rhs = x.apply(&self.up_proj)?;
+        (lhs * rhs)?.apply(&self.down_proj)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Qwen3Attention {
+    // projections
+    q_proj: LoraLinearRt,
+    k_proj: LoraLinearRt,
+    v_proj: LoraLinearRt,
+    o_proj: LoraLinearRt,
+    // norms
+    q_norm: candle_transformers::models::with_tracing::RmsNorm,
+    k_norm: candle_transformers::models::with_tracing::RmsNorm,
+    // hyper params
+    num_heads: usize,
+    num_kv_heads: usize,
+    num_kv_groups: usize,
+    head_dim: usize,
+    hidden_size: usize,
+    // utils
+    rotary_emb: Arc<Qwen3RotaryEmbedding>,
+    kv_cache: KvCache,
+    kv_cache_dtype: DType,
+    compute_dtype: DType,
+}
+
+impl Qwen3Attention {
+    fn new(
+        cfg: &Config,
+        rotary_emb: Arc<Qwen3RotaryEmbedding>,
+        compute_dtype: DType,
+        kv_cache_dtype: DType,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        if cfg.use_sliding_window {
+            return Err(candle_core::Error::Msg("sliding window is not supported".to_string()).bt());
+        }
+
+        let head_dim = cfg.head_dim;
+        let num_heads = cfg.num_attention_heads;
+        let num_kv_heads = cfg.num_key_value_heads;
+        let num_kv_groups = num_heads / num_kv_heads;
+
+        let q_proj = LoraLinearRt::new_with_bias(
+            cfg.hidden_size,
+            num_heads * head_dim,
+            cfg.attention_bias,
+            vb.pp("q_proj"),
+            "self_attn.q_proj",
+        )?;
+        let k_proj = LoraLinearRt::new_with_bias(
+            cfg.hidden_size,
+            num_kv_heads * head_dim,
+            cfg.attention_bias,
+            vb.pp("k_proj"),
+            "self_attn.k_proj",
+        )?;
+        let v_proj = LoraLinearRt::new_with_bias(
+            cfg.hidden_size,
+            num_kv_heads * head_dim,
+            cfg.attention_bias,
+            vb.pp("v_proj"),
+            "self_attn.v_proj",
+        )?;
+        let o_proj = LoraLinearRt::new_with_bias(
+            num_heads * head_dim,
+            cfg.hidden_size,
+            cfg.attention_bias,
+            vb.pp("o_proj"),
+            "self_attn.o_proj",
+        )?;
+
+        let q_norm = candle_transformers::models::with_tracing::RmsNorm::new(
+            head_dim,
+            cfg.rms_norm_eps,
+            vb.pp("q_norm"),
+        )?;
+        let k_norm = candle_transformers::models::with_tracing::RmsNorm::new(
+            head_dim,
+            cfg.rms_norm_eps,
+            vb.pp("k_norm"),
+        )?;
+
+        // Necessary because the hidden_size in the config isn't always accurate
+        let hidden_size = head_dim * cfg.num_attention_heads;
+
+        let kv_cache = KvCache::new(2, 512);
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            num_heads,
+            num_kv_heads,
+            num_kv_groups,
+            head_dim,
+            hidden_size,
+            rotary_emb,
+            kv_cache,
+            kv_cache_dtype,
+            compute_dtype,
+        })
+    }
+
+    fn apply_adapter(&mut self, prefix: &str, map: &HashMap<String, (Tensor, Tensor)>, scale: f64) {
+        for (name, lin) in [
+            (format!("{prefix}.self_attn.q_proj"), &mut self.q_proj),
+            (format!("{prefix}.self_attn.k_proj"), &mut self.k_proj),
+            (format!("{prefix}.self_attn.v_proj"), &mut self.v_proj),
+            (format!("{prefix}.self_attn.o_proj"), &mut self.o_proj),
+        ] {
+            if let Some((a, b)) = map.get(&name).cloned() {
+                tracing::debug!("Applied attention LoRA adapter: {} -> {}", name, lin.name());
+                lin.set_adapter(a, b, scale);
+            } else {
+                tracing::debug!("No attention LoRA adapter found for: {}", name);
+            }
+        }
+    }
+
+    fn clear_adapter(&mut self) {
+        self.q_proj.clear_adapter();
+        self.k_proj.clear_adapter();
+        self.v_proj.clear_adapter();
+        self.o_proj.clear_adapter();
+    }
+
+    fn forward(&mut self, x: &Tensor, attn_mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+        let (b, l, _) = x.dims3()?;
+
+        // 1. Proj (convert to compute dtype only if needed)
+        let q_proj = self.q_proj.forward(x)?;
+        let k_proj = self.k_proj.forward(x)?;
+        let v_proj = self.v_proj.forward(x)?;
+        let q = if q_proj.dtype() != self.compute_dtype {
+            q_proj.to_dtype(self.compute_dtype)?
+        } else {
+            q_proj
+        };
+        let k = if k_proj.dtype() != self.compute_dtype {
+            k_proj.to_dtype(self.compute_dtype)?
+        } else {
+            k_proj
+        };
+        let v = if v_proj.dtype() != self.compute_dtype {
+            v_proj.to_dtype(self.compute_dtype)?
+        } else {
+            v_proj
+        };
+
+        // 2. Reshape: (B, L, H, D) -> (B, H, L, D)
+        let q = q
+            .reshape((b, l, self.num_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let k = k
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+        let v = v
+            .reshape((b, l, self.num_kv_heads, self.head_dim))?
+            .transpose(1, 2)?;
+
+        // 3. Per-head RMSNorm
+        let q_flat = q.flatten(0, 2)?; // (B*H, L, D) -> (BHL, D) after transpose later
+        let k_flat = k.flatten(0, 2)?;
+        let q_flat = self.q_norm.forward(&q_flat)?;
+        let k_flat = self.k_norm.forward(&k_flat)?;
+        let q = q_flat.reshape((b, self.num_heads, l, self.head_dim))?;
+        let k = k_flat.reshape((b, self.num_kv_heads, l, self.head_dim))?;
+
+        // 4. RoPE
+        let (q, k) = self.rotary_emb.apply(&q, &k, offset)?;
+
+        // 5. Accumulate KV cache - convert dtype only if needed to avoid overhead
+        let k_contiguous = k.contiguous()?;
+        let v_contiguous = v.contiguous()?;
+        let k_cache = if k_contiguous.dtype() != self.kv_cache_dtype {
+            k_contiguous.to_dtype(self.kv_cache_dtype)?
+        } else {
+            k_contiguous
+        };
+        let v_cache = if v_contiguous.dtype() != self.kv_cache_dtype {
+            v_contiguous.to_dtype(self.kv_cache_dtype)?
+        } else {
+            v_contiguous
+        };
+        let (k, v) = self.kv_cache.append(&k_cache, &v_cache)?;
+
+        // 6. GQA repeat_kv
+        let k = candle_transformers::utils::repeat_kv(k, self.num_kv_groups)?;
+        let v = candle_transformers::utils::repeat_kv(v, self.num_kv_groups)?;
+
+        // 7. Attention score
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        if let Some(m) = attn_mask {
+            let key_len = k.dim(2)?;
+            let query_len = q.dim(2)?;
+            let mask_query_len = m.dim(2)?;
+            let mask_key_len = m.dim(3)?;
+
+            // Ensure mask dimensions match the actual query and key lengths
+            let adjusted_mask = if mask_query_len != query_len || mask_key_len != key_len {
+                let q_slice = mask_query_len.min(query_len);
+                let k_slice = mask_key_len.min(key_len);
+                m.narrow(2, mask_query_len - q_slice, q_slice)?
+                    .narrow(3, mask_key_len - k_slice, k_slice)?
+            } else {
+                m.clone()
+            };
+            scores = scores.broadcast_add(&adjusted_mask)?;
+        }
+        let probs = candle_nn::ops::softmax_last_dim(&scores)?;
+        let ctx = probs.matmul(&v)?; // (B, H, L, D)
+
+        // 8. Output proj
+        ctx.transpose(1, 2)?
+            .reshape((b, l, self.hidden_size))?
+            .apply(&self.o_proj)
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.kv_cache.reset();
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DecoderLayer {
+    self_attn: Qwen3Attention,
+    mlp: Qwen3MLP,
+    ln1: candle_transformers::models::with_tracing::RmsNorm,
+    ln2: candle_transformers::models::with_tracing::RmsNorm,
+}
+
+impl DecoderLayer {
+    fn new(
+        cfg: &Config,
+        rotary: Arc<Qwen3RotaryEmbedding>,
+        compute_dtype: DType,
+        kv_cache_dtype: DType,
+        vb: VarBuilder,
+    ) -> Result<Self> {
+        let self_attn = Qwen3Attention::new(cfg, rotary, compute_dtype, kv_cache_dtype, vb.pp("self_attn"))?;
+        let mlp = Qwen3MLP::new(cfg, vb.pp("mlp"))?;
+        let ln1 = candle_transformers::models::with_tracing::RmsNorm::new(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("input_layernorm"),
+        )?;
+        let ln2 = candle_transformers::models::with_tracing::RmsNorm::new(
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            vb.pp("post_attention_layernorm"),
+        )?;
+        Ok(Self { self_attn, mlp, ln1, ln2 })
+    }
+
+    fn forward(&mut self, x: &Tensor, mask: Option<&Tensor>, offset: usize) -> Result<Tensor> {
+        let h = self.ln1.forward(x)?;
+        let h = self.self_attn.forward(&h, mask, offset)?;
+        let x = (x + h)?;
+        let h2 = self.ln2.forward(&x)?;
+        let h2 = h2.apply(&self.mlp)?;
+        x + h2
+    }
+
+    fn clear_kv_cache(&mut self) {
+        self.self_attn.clear_kv_cache();
+    }
+
+    fn apply_adapter(&mut self, layer_idx: usize, map: &HashMap<String, (Tensor, Tensor)>, scale: f64) {
+        let prefix = format!("model.layers.{layer_idx}");
+        self.self_attn.apply_adapter(&prefix, map, scale);
+        self.mlp.apply_adapter(&prefix, map, scale);
+    }
+
+    fn clear_adapter(&mut self) {
+        self.self_attn.clear_adapter();
+        self.mlp.clear_adapter();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3LoraModel {
+    embed_tokens: nn::Embedding,
+    layers: Vec<DecoderLayer>,
+    norm: candle_transformers::models::with_tracing::RmsNorm,
+    device: Device,
+    compute_dtype: DType,
+}
+
+impl Qwen3LoraModel {
+    pub fn new(cfg: &Config, compute_dtype: DType, kv_cache_dtype: DType, vb: VarBuilder) -> Result<Self> {
+        let embed_tokens = nn::embedding(cfg.vocab_size, cfg.hidden_size, vb.pp("model.embed_tokens"))?;
+        let rotary = Arc::new(Qwen3RotaryEmbedding::new(vb.dtype(), compute_dtype, cfg, vb.device())?);
+        let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
+        let vb_l = vb.pp("model.layers");
+        for i in 0..cfg.num_hidden_layers {
+            layers.push(DecoderLayer::new(cfg, rotary.clone(), compute_dtype, kv_cache_dtype, vb_l.pp(i))?);
+        }
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm: candle_transformers::models::with_tracing::RmsNorm::new(
+                cfg.hidden_size,
+                cfg.rms_norm_eps,
+                vb.pp("model.norm"),
+            )?,
+            device: vb.device().clone(),
+            compute_dtype,
+        })
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for l in &mut self.layers {
+            l.clear_kv_cache();
+        }
+    }
+
+    fn causal_mask(&self, b: usize, tgt: usize, offset: usize) -> Result<Tensor> {
+        let mask: Vec<_> = (0..tgt)
+            .flat_map(|i| (0..tgt).map(move |j| if i < j { f32::NEG_INFINITY } else { 0. }))
+            .collect();
+        let mask = Tensor::from_slice(&mask, (tgt, tgt), &self.device)?.to_dtype(self.compute_dtype)?;
+        let mask = if offset > 0 {
+            let mask0 = Tensor::zeros((tgt, offset), self.compute_dtype, &self.device)?;
+            Tensor::cat(&[&mask0, &mask], 1)?
+        } else {
+            mask
+        };
+        mask.expand((b, 1, tgt, tgt + offset))?.to_dtype(self.compute_dtype)
+    }
+
+    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        let (b, l) = input.dims2()?;
+        let mut h = self.embed_tokens.forward(input)?;
+
+        let causal = if l == 1 {
+            None
+        } else {
+            // Use actual KV cache length instead of offset
+            let kv_len = self.layers[0].self_attn.kv_cache.current_seq_len();
+            Some(self.causal_mask(b, l, kv_len)?)
+        };
+
+        for layer_idx in 0..self.layers.len() {
+            let layer = &mut self.layers[layer_idx];
+            h = layer.forward(&h, causal.as_ref(), offset)?;
+        }
+        self.norm.forward(&h)
+    }
+
+    /// Apply an HF-style adapter mapping to all LoRA-capable linear layers.
+    /// Keys should be full module paths, e.g. "model.layers.0.self_attn.q_proj.lora_A.weight".
+    /// Scale should be alpha / r from the adapter config.
+    pub fn apply_adapter(&mut self, map: &HashMap<String, (Tensor, Tensor)>, scale: f64) {
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            layer.apply_adapter(i, map, scale);
+        }
+    }
+
+    pub fn clear_adapter(&mut self) {
+        for layer in &mut self.layers {
+            layer.clear_adapter();
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Qwen3LoraForCausalLM {
+    base: Qwen3LoraModel,
+    lm_head: LoraLinearRt,
+}
+
+impl Qwen3LoraForCausalLM {
+    pub fn new(cfg: &Config, compute_dtype: DType, kv_cache_dtype: DType, vb: VarBuilder) -> Result<Self> {
+        let base = Qwen3LoraModel::new(cfg, compute_dtype, kv_cache_dtype, vb.clone())?;
+        let lm_head = if cfg.tie_word_embeddings {
+            LoraLinearRt::from_weights(base.embed_tokens.embeddings().clone(), None, "lm_head")
+        } else {
+            LoraLinearRt::new_with_bias(cfg.hidden_size, cfg.vocab_size, false, vb.pp("lm_head"), "lm_head")?
+        };
+        Ok(Self { base, lm_head })
+    }
+
+    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        let (_, l) = input.dims2()?;
+        self.base
+            .forward(input, offset)?
+            .narrow(1, l - 1, 1)?
+            .apply(&self.lm_head)
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        self.base.clear_kv_cache();
+    }
+
+    pub fn apply_adapter(&mut self, map: &HashMap<String, (Tensor, Tensor)>, scale: f64) {
+        self.base.apply_adapter(map, scale);
+        // Optional: some adapters also provide lm_head A/B.
+        if let Some((a, b)) = map.get("lm_head").cloned() {
+            self.lm_head.set_adapter(a, b, scale);
+        }
+    }
+
+    pub fn clear_adapter(&mut self) {
+        self.base.clear_adapter();
+        self.lm_head.clear_adapter();
+    }
+}

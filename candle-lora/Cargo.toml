@@ -1,0 +1,23 @@
+[package]
+name = "candle-lora"
+version = "0.9.1"
+edition = "2021"
+description = "LoRA (Low-Rank Adaptation) support for Candle ML framework"
+repository = "https://github.com/GardenVarietyAI/candle"
+keywords = ["lora", "machine-learning", "candle", "fine-tuning"]
+categories = ["machine-learning", "science"]
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+candle-core = { path = "../candle-core", default-features = false }
+candle-nn = { path = "../candle-nn" }
+candle-transformers = { path = "../candle-transformers" }
+tracing = "0.1"
+
+[features]
+default = []
+cuda = ["candle-core/cuda"]
+cudnn = ["candle-core/cudnn"]
+mkl = ["candle-core/mkl"]
+accelerate = ["candle-core/accelerate"]
+metal = ["candle-core/metal"]
