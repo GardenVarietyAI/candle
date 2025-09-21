@@ -429,4 +429,24 @@ impl ModelWeights {
         let last_hidden = h.narrow(1, l - 1, 1)?;
         self.lm_head.forward(&last_hidden)?.squeeze(1)
     }
+    
+    /// Get hidden states for embeddings (without lm_head projection)
+    pub fn forward_embeddings(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        let _enter = self.span.enter();
+        let (b, l) = input.dims2()?;
+        let mut h = self.embed_tokens.forward(input)?;
+        let causal_mask = if l == 1 {
+            None
+        } else {
+            Some(self.causal_mask(b, l, offset)?)
+        };
+        for layer in self.layers.iter_mut() {
+            h = layer.forward(&h, causal_mask.as_ref(), offset)?;
+        }
+        // Apply normalization
+        let h = self.norm.forward(&h)?;
+        // Return the last token's hidden state (shape: [batch, hidden_dim])
+        // This is the hidden state before the lm_head projection
+        h.narrow(1, l - 1, 1)?.squeeze(1)
+    }
 }
