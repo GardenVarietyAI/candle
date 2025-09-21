@@ -431,7 +431,9 @@ impl ModelWeights {
     }
     
     /// Get hidden states for embeddings (without lm_head projection)
-    pub fn forward_embeddings(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+    /// If seq_lengths is provided, extracts the last real token for each sequence (for padded batches)
+    /// Otherwise, takes the last token of each sequence (assumes no padding)
+    pub fn forward_embeddings(&mut self, input: &Tensor, offset: usize, seq_lengths: Option<&[usize]>) -> Result<Tensor> {
         let _enter = self.span.enter();
         let (b, l) = input.dims2()?;
         let mut h = self.embed_tokens.forward(input)?;
@@ -445,8 +447,32 @@ impl ModelWeights {
         }
         // Apply normalization
         let h = self.norm.forward(&h)?;
-        // Return the last token's hidden state (shape: [batch, hidden_dim])
-        // This is the hidden state before the lm_head projection
-        h.narrow(1, l - 1, 1)?.squeeze(1)
+        
+        // Extract last tokens based on whether we have sequence lengths
+        match seq_lengths {
+            None => {
+                // No padding - take the last position for all sequences
+                h.narrow(1, l - 1, 1)?.squeeze(1)
+            }
+            Some(lengths) => {
+                // Padded batch - extract last real token for each sequence
+                if lengths.len() != b {
+                    candle::bail!("seq_lengths len {} != batch size {}", lengths.len(), b);
+                }
+                
+                let mut last_tokens = Vec::with_capacity(b);
+                for (i, &seq_len) in lengths.iter().enumerate() {
+                    if seq_len == 0 || seq_len > l {
+                        candle::bail!("Invalid sequence length {} for batch item {}", seq_len, i);
+                    }
+                    // Get hidden state at the last real token position
+                    let last_token = h.get(i)?.get(seq_len - 1)?;
+                    last_tokens.push(last_token);
+                }
+                
+                // Stack into [batch, hidden_dim] tensor
+                Tensor::stack(&last_tokens, 0)
+            }
+        }
     }
 }
